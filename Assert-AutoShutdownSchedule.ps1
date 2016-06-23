@@ -45,6 +45,7 @@
     .OUTPUTS
         Human-readable informational and error messages produced during the job. Not intended to be consumed by another runbook.
 #>
+
 param(
     [parameter(Mandatory=$false)]
 	[String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
@@ -54,29 +55,36 @@ param(
     [bool]$Simulate = $false
 )
 
+
 $VERSION = '3.1.0'
 $autoShutdownTagName = 'AutoShutdownSchedule'
 
 $ResourceProcessors = @(
   @{
     ResourceType = 'Microsoft.ClassicCompute/virtualMachines'
-    PowerStateAction = { param([object]$Resource) (Get-AzureRmResource -ResourceId $Resource.ResourceId).Properties.InstanceView.PowerState }
+    PowerStateAction = { param([object]$Resource, [string]$DesiredState) (Get-AzureRmResource -ResourceId $Resource.ResourceId).Properties.InstanceView.PowerState }
     StartAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'start' -Force } 
     DeallocateAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'shutdown' -Force } 
   },
   @{
     ResourceType = 'Microsoft.Compute/virtualMachines'
     PowerStateAction = { 
-      param([object]$Resource)
+      param([object]$Resource, [string]$DesiredState)
       
       $vm = Get-AzureRmVM -ResourceGroupName $Resource.ResourceGroupName -Name $Resource.Name -Status
-      $currentStatus = $vm.Statuses | where Code -like "PowerState*" 
-      $currentStatus.Code -replace "PowerState/",""
+      $currentStatus = $vm.Statuses | Where-Object Code -like 'PowerState*' 
+      $currentStatus.Code -replace 'PowerState/',''
     }
     StartAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'start' -Force } 
     DeallocateAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'deallocate' -Force } 
+  },
+  @{
+    ResourceType = 'Microsoft.Compute/virtualMachineScaleSets'
+    #since there is no way to get the status of a VMSS, we assume it is in the inverse state to force the action on the whole VMSS
+    PowerStateAction = { param([object]$Resource, [string]$DesiredState) if($DesiredState -eq 'StoppedDeallocated') { 'Started' } else { 'StoppedDeallocated' } }
+    StartAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'start' -Parameters @{ instanceIds = @('*') } -Force } 
+    DeallocateAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'deallocate' -Parameters @{ instanceIds = @('*') } -Force } 
   }
-
 )
 
 # Define function to check current time against specified range
@@ -90,9 +98,9 @@ function CheckScheduleEntry ([string]$TimeRange)
 	try
 	{
 	    # Parse as range if contains '->'
-	    if($TimeRange -like "*->*")
+	    if($TimeRange -like '*->*')
 	    {
-	        $timeRangeComponents = $TimeRange -split "->" | foreach {$_.Trim()}
+	        $timeRangeComponents = $TimeRange -split '->' | foreach {$_.Trim()}
 	        if($timeRangeComponents.Count -eq 2)
 	        {
 	            $rangeStart = Get-Date $timeRangeComponents[0]
@@ -126,7 +134,7 @@ function CheckScheduleEntry ([string]$TimeRange)
 	        {
 	            if($TimeRange -eq (Get-Date).DayOfWeek)
 	            {
-	                $parsedDay = Get-Date "00:00"
+	                $parsedDay = Get-Date '00:00'
 	            }
 	            else
 	            {
@@ -177,13 +185,13 @@ function AssertResourcePowerState
         [bool]$Simulate
     )
 
-  $processor = $ResourceProcessors | ? ResourceType -eq $Resource.ResourceType
+  $processor = $ResourceProcessors | Where-Object ResourceType -eq $Resource.ResourceType
   if(-not $processor) {
     throw "Unable to find a resource processor for type '$($Resource.ResourceType)'"
   }
   # If should be started and isn't, start resource
-  $currentPowerState = & $processor.PowerStateAction -Resource $Resource
-	if($DesiredState -eq "Started" -and $currentPowerState -notmatch "Started|Starting")
+  $currentPowerState = & $processor.PowerStateAction -Resource $Resource -DesiredState $DesiredState
+	if($DesiredState -eq 'Started' -and $currentPowerState -notmatch 'Started|Starting')
 	{
 		if($Simulate)
         {
@@ -192,12 +200,12 @@ function AssertResourcePowerState
         else
         {
             Write-Output "[$($Resource.Name)]: Starting resource"
-            & $processor.StartAction -ResourceId $Resource.Id
+            & $processor.StartAction -ResourceId $Resource.ResourceId
         }
 	}
 		
 	# If should be stopped and isn't, stop resource
-	elseif($DesiredState -eq "StoppedDeallocated" -and $currentPowerState -ne "Stopped")
+	elseif($DesiredState -eq 'StoppedDeallocated' -and $currentPowerState -ne 'Stopped')
 	{
         if($Simulate)
         {
@@ -206,7 +214,7 @@ function AssertResourcePowerState
         else
         {
             Write-Output "[$($Resource.Name)]: Stopping resource"
-            & $processor.StopAction -ResourceId $Resource.Id
+            & $processor.StopAction -ResourceId $Resource.ResourceId
         }
 	}
 
@@ -224,18 +232,18 @@ try
     Write-Output "Runbook started. Version: $VERSION"
     if($Simulate)
     {
-        Write-Output "*** Running in SIMULATE mode. No power actions will be taken. ***"
+        Write-Output '*** Running in SIMULATE mode. No power actions will be taken. ***'
     }
     else
     {
-        Write-Output "*** Running in LIVE mode. Schedules will be enforced. ***"
+        Write-Output '*** Running in LIVE mode. Schedules will be enforced. ***'
     }
-    Write-Output "Current UTC/GMT time [$($currentTime.ToString("dddd, yyyy MMM dd HH:mm:ss"))] will be checked against schedules"
+    Write-Output "Current UTC/GMT time [$($currentTime.ToString('dddd, yyyy MMM dd HH:mm:ss'))] will be checked against schedules"
 	
     # Retrieve subscription name from variable asset if not specified
-    if($AzureSubscriptionName -eq "Use *Default Azure Subscription* Variable Value")
+    if($AzureSubscriptionName -eq 'Use *Default Azure Subscription* Variable Value')
     {
-        $AzureSubscriptionName = Get-AutomationVariable -Name "Default Azure Subscription"
+        $AzureSubscriptionName = Get-AutomationVariable -Name 'Default Azure Subscription'
         if($AzureSubscriptionName.length -gt 0)
         {
             Write-Output "Specified subscription name/ID: [$AzureSubscriptionName]"
@@ -248,10 +256,10 @@ try
 
     # Retrieve credential
     write-output "Specified credential asset name: [$AzureCredentialName]"
-    if($AzureCredentialName -eq "Use *Default Automation Credential* asset")
+    if($AzureCredentialName -eq 'Use *Default Automation Credential* asset')
     {
         # By default, look for "Default Automation Credential" asset
-        $azureCredential = Get-AutomationPSCredential -Name "Default Automation Credential"
+        $azureCredential = Get-AutomationPSCredential -Name 'Default Automation Credential'
         if($azureCredential -ne $null)
         {
 		    Write-Output "Attempting to authenticate as: [$($azureCredential.UserName)]"
@@ -284,11 +292,11 @@ try
 
 
     # Validate subscription
-    $subscriptions = @(Get-AzureRmSubscription | where {$_.SubscriptionName -eq $AzureSubscriptionName -or $_.SubscriptionId -eq $AzureSubscriptionName})
+    $subscriptions = @(Get-AzureRmSubscription | Where-Object {$_.SubscriptionName -eq $AzureSubscriptionName -or $_.SubscriptionId -eq $AzureSubscriptionName})
     if($subscriptions.Count -eq 1)
     {
         # Set working subscription
-        $targetSubscription = $subscriptions | select -First 1
+        $targetSubscription = $subscriptions | Select-Object -First 1
         Set-AzureRmContext -SubscriptionId $targetSubscription.SubscriptionId
 
         $currentSubscription = (Get-AzureRmContext).Subscription
@@ -309,12 +317,13 @@ try
     $resourceList = @()
     # Get a list of all supported resources in subscription
     $ResourceProcessors | % {
-      $resourceList += @(Find-AzureRmResource -ResourceType $_.ResourceType | sort Name)
+      Write-Output ('Looking for resources of type {0}' -f $_.ResourceType)
+      $resourceList += @(Find-AzureRmResource -ResourceType $_.ResourceType | Sort-Object Name)
     }
 
     # Get resource groups that are tagged for automatic shutdown of resources
-	$taggedResourceGroups = @(Get-AzureRmResourceGroup | where {$_.Tags.Count -gt 0 -and $_.Tags.Name -contains $autoShutdownTagName})
-    $taggedResourceGroupNames = @($taggedResourceGroups | select -ExpandProperty ResourceGroupName)
+	$taggedResourceGroups = @(Get-AzureRmResourceGroup | Where-Object {$_.Tags.Count -gt 0 -and $_.Tags.Name -contains $autoShutdownTagName})
+    $taggedResourceGroupNames = @($taggedResourceGroups | Select-Object -ExpandProperty ResourceGroupName)
     Write-Output "Found [$($taggedResourceGroups.Count)] schedule-tagged resource groups in subscription"	
 
     # For each resource, determine
@@ -330,14 +339,14 @@ try
         if($resource.Tags -and $resource.Tags.Name -contains $autoShutdownTagName)
         {
             # Resource has direct tag (possible for resource manager deployment model resources). Prefer this tag schedule.
-            $schedule = ($resource.Tags | where Name -eq $autoShutdownTagName)["Value"]
+            $schedule = ($resource.Tags | Where-Object Name -eq $autoShutdownTagName)['Value']
             Write-Output "[$($resource.Name)]: Found direct resource schedule tag with value: $schedule"
         }
         elseif($taggedResourceGroupNames -contains $resource.ResourceGroupName)
         {
             # resource belongs to a tagged resource group. Use the group tag
-            $parentGroup = $taggedResourceGroups | where ResourceGroupName -eq $resource.ResourceGroupName
-            $schedule = ($parentGroup.Tags | where Name -eq $autoShutdownTagName)["Value"]
+            $parentGroup = $taggedResourceGroups | Where-Object ResourceGroupName -eq $resource.ResourceGroupName
+            $schedule = ($parentGroup.Tags | Where-Object Name -eq $autoShutdownTagName)['Value']
             Write-Output "[$($resource.Name)]: Found parent resource group schedule tag with value: $schedule"
         }
         else
@@ -355,7 +364,7 @@ try
         }
 
         # Parse the ranges in the Tag value. Expects a string of comma-separated time ranges, or a single time range
-		$timeRangeList = @($schedule -split "," | foreach {$_.Trim()})
+		$timeRangeList = @($schedule -split ',' | foreach {$_.Trim()})
 	    
         # Check each range against the current time to see if any schedule is matched
 		$scheduleMatched = $false
@@ -375,17 +384,17 @@ try
 		{
             # Schedule is matched. Shut down the resource if it is running. 
 		    Write-Output "[$($resource.Name)]: Current time [$currentTime] falls within the scheduled shutdown range [$matchedSchedule]"
-		    AssertResourcePowerState -Resource $resource -DesiredState "StoppedDeallocated"-Simulate $Simulate
+		    AssertResourcePowerState -Resource $resource -DesiredState 'StoppedDeallocated'-Simulate $Simulate
 		}
 		else
 		{
             # Schedule not matched. Start resource if stopped.
 		    Write-Output "[$($resource.Name)]: Current time falls outside of all scheduled shutdown ranges."
-		    AssertResourcePowerState -Resource $resource -DesiredState "Started" -Simulate $Simulate
+		    AssertResourcePowerState -Resource $resource -DesiredState 'Started' -Simulate $Simulate
 		}	    
     }
 
-    Write-Output "Finished processing resource schedules"
+    Write-Output 'Finished processing resource schedules'
 }
 catch
 {
@@ -394,5 +403,5 @@ catch
 }
 finally
 {
-    Write-Output "Runbook finished (Duration: $(("{0:hh\:mm\:ss}" -f ((Get-Date).ToUniversalTime() - $currentTime))))"
+    Write-Output "Runbook finished (Duration: $(('{0:hh\:mm\:ss}' -f ((Get-Date).ToUniversalTime() - $currentTime))))"
 }
