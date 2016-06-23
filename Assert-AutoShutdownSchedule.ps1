@@ -45,7 +45,18 @@
     .OUTPUTS
         Human-readable informational and error messages produced during the job. Not intended to be consumed by another runbook.
 #>
-
+[CmdletBinding(DefaultParameterSetName='ByCredentialName')]
+param(
+    [parameter(Mandatory=$false, ParameterSetName='ByCredential')]
+  [PSCredential] $AzureCredential,    
+    [parameter(Mandatory=$false, ParameterSetName='ByCredentialName')]
+	[String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
+    [parameter(Mandatory=$false)]
+	[String] $AzureSubscriptionName = "Use *Default Azure Subscription* Variable Value",
+    [parameter(Mandatory=$false)]
+    [bool]$Simulate = $false
+)
+<#
 param(
     [parameter(Mandatory=$false)]
 	[String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
@@ -54,7 +65,7 @@ param(
     [parameter(Mandatory=$false)]
     [bool]$Simulate = $false
 )
-
+#>
 
 $VERSION = '3.1.0'
 $autoShutdownTagName = 'AutoShutdownSchedule'
@@ -254,29 +265,31 @@ try
         }
     }
 
-    # Retrieve credential
-    write-output "Specified credential asset name: [$AzureCredentialName]"
-    if($AzureCredentialName -eq 'Use *Default Automation Credential* asset')
-    {
-        # By default, look for "Default Automation Credential" asset
-        $azureCredential = Get-AutomationPSCredential -Name 'Default Automation Credential'
-        if($azureCredential -ne $null)
-        {
-		    Write-Output "Attempting to authenticate as: [$($azureCredential.UserName)]"
-        }
-        else
-        {
-            throw "No automation credential name was specified, and no credential asset with name 'Default Automation Credential' was found. Either specify a stored credential name or define the default using a credential asset"
-        }
-    }
-    else
-    {
-        # A different credential name was specified, attempt to load it
-        $azureCredential = Get-AutomationPSCredential -Name $AzureCredentialName
-        if($azureCredential -eq $null)
-        {
-            throw "Failed to get credential with name [$AzureCredentialName]"
-        }
+    if($PSCmdlet.ParameterSetName -eq 'ByCredentialName') {
+      # Retrieve credential
+      write-output "Specified credential asset name: [$AzureCredentialName]"
+      if($AzureCredentialName -eq 'Use *Default Automation Credential* asset')
+      {
+          # By default, look for "Default Automation Credential" asset
+          $azureCredential = Get-AutomationPSCredential -Name 'Default Automation Credential'
+          if($azureCredential -ne $null)
+          {
+		      Write-Output "Attempting to authenticate as: [$($azureCredential.UserName)]"
+          }
+          else
+          {
+              throw "No automation credential name was specified, and no credential asset with name 'Default Automation Credential' was found. Either specify a stored credential name or define the default using a credential asset"
+          }
+      }
+      else
+      {
+          # A different credential name was specified, attempt to load it
+          $azureCredential = Get-AutomationPSCredential -Name $AzureCredentialName
+          if($azureCredential -eq $null)
+          {
+              throw "Failed to get credential with name [$AzureCredentialName]"
+          }
+      }
     }
 
     # Connect via Azure Resource Manager 
