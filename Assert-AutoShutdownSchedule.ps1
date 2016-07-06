@@ -1,4 +1,4 @@
-ï»¿<#
+<#
     .SYNOPSIS
         This Azure Automation runbook automates the scheduled shutdown and startup of resources in an Azure subscription. 
 
@@ -11,9 +11,10 @@
 
         This is a PowerShell runbook, as opposed to a PowerShell Workflow runbook.
 
-        This runbook requires the "AzureRM.Resources" modules which are present by default in Azure Automation accounts.
+        This script requires the "AzureRM.Resources" modules which are present by default in Azure Automation accounts.
         For detailed documentation and instructions, see: 
         
+        CREDITS: Initial version credits goes to automys from which this script started :
         https://automys.com/library/asset/scheduled-virtual-machine-shutdown-startup-microsoft-azure
 
     .PARAMETER AzureCredentialName
@@ -34,6 +35,19 @@
         If $true, the runbook will not perform any power actions and will only simulate evaluating the tagged schedules. Use this
         to test your runbook to see what it will do when run normally (Simulate = $false).
 
+    .PARAMETER DefaultScheduleIfNotPresent
+        If provided, will set the default schedule to apply on all resources that don't have any scheduled tag value defined or inherited.
+
+        Description | Tag value
+        Shut down from 10PM to 6 AM UTC every day | 10pm -> 6am
+        Shut down from 10PM to 6 AM UTC every day (different format, same result as above) | 22:00 -> 06:00
+        Shut down from 8PM to 12AM and from 2AM to 7AM UTC every day (bringing online from 12-2AM for maintenance in between) | 8PM -> 12AM, 2AM -> 7AM
+        Shut down all day Saturday and Sunday (midnight to midnight) | Saturday, Sunday
+        Shut down from 2AM to 7AM UTC every day and all day on weekends | 2:00 -> 7:00, Saturday, Sunday
+        Shut down on Christmas Day and New Year’s Day | December 25, January 1
+        Shut down from 2AM to 7AM UTC every day, and all day on weekends, and on Christmas Day | 2:00 -> 7:00, Saturday, Sunday, December 25
+        Shut down always – I don’t want this VM online, ever | 0:00 -> 23:59:59
+
     .EXAMPLE
         For testing examples, see the documentation at:
 
@@ -45,18 +59,19 @@
     .OUTPUTS
         Human-readable informational and error messages produced during the job. Not intended to be consumed by another runbook.
 #>
-
+[CmdletBinding()]
 param(
     [parameter(Mandatory=$false)]
-	[String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
+    [String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
     [parameter(Mandatory=$false)]
-	[String] $AzureSubscriptionName = "Use *Default Azure Subscription* Variable Value",
+    [String] $AzureSubscriptionName = "Use *Default Azure Subscription* Variable Value",
     [parameter(Mandatory=$false)]
-    [bool]$Simulate = $false
+    [bool]$Simulate = $false,
+    [parameter(Mandatory=$false)]
+    [string]$DefaultScheduleIfNotPresent
 )
 
-
-$VERSION = '3.2.0'
+$VERSION = '3.3.0'
 $autoShutdownTagName = 'AutoShutdownSchedule'
 $autoShutdownOrderTagName = 'ProcessingOrder'
 $defaultOrder = 1000
@@ -90,7 +105,7 @@ $ResourceProcessors = @(
 )
 
 # Define function to check current time against specified range
-function CheckScheduleEntry ([string]$TimeRange)
+function Test-ScheduleEntry ([string]$TimeRange)
 {	
 	# Initialize variables
 	$rangeStart, $rangeEnd, $parsedDay = $null
@@ -173,11 +188,11 @@ function CheckScheduleEntry ([string]$TimeRange)
 	    return $false
 	}
 	
-} # End function CheckScheduleEntry
+} # End function Test-ScheduleEntry
 
 
 # Function to handle power state assertion for resources
-function AssertResourcePowerState
+function Assert-ResourcePowerState
 {
     param(
         [Parameter(Mandatory=$true)]
@@ -216,7 +231,7 @@ function AssertResourcePowerState
         else
         {
             Write-Output "[$($Resource.Name) `- P$($Resource.ProcessingOrder)]: Stopping resource"
-            & $processor.StopAction -ResourceId $Resource.ResourceId
+            & $processor.DeallocateAction -ResourceId $Resource.ResourceId
         }
 	}
 
@@ -308,7 +323,7 @@ try
     {
         if($subscription.Count -eq 0)
         {
-            throw "No accessible subscription found with name or ID [$AzureSubscriptionName]. Check the runbook parameters and ensure user is a co-administrator on the target subscription."
+            throw "No accessible subscription found with name or ID [$AzureSubscriptionName]. Check the runbook parameters and ensure user has proper rights on the target subscription."
         }
         elseif($subscriptions.Count -gt 1)
         {
@@ -334,9 +349,12 @@ try
 
 
     # Get resource groups that are tagged for automatic shutdown of resources
-	$taggedResourceGroups = @(Get-AzureRmResourceGroup | Where-Object {$_.Tags.Count -gt 0 -and $_.Tags.Name -contains $autoShutdownTagName})
-    $taggedResourceGroupNames = @($taggedResourceGroups | Select-Object -ExpandProperty ResourceGroupName)
-    Write-Output "Found [$($taggedResourceGroups.Count)] schedule-tagged resource groups in subscription"	
+    $resourceGroups = @(Get-AzureRmResourceGroup)
+    $taggedResourceGroupNames = @($resourceGroups | Where-Object {$_.Tags.Count -gt 0 -and $_.Tags.Name -contains $autoShutdownTagName} | Select-Object -ExpandProperty ResourceGroupName)
+    Write-Output "Found [$($taggedResourceGroupNames.Count)] schedule-tagged resource groups in subscription"	
+    if($DefaultScheduleIfNotPresent) {
+      Write-Output "Default schedule was specified, all non tagged resources will inherit this schedule: $DefaultScheduleIfNotPresent"
+    }
 
     # For each resource, determine
     #  - Is it directly tagged for shutdown or member of a tagged resource group
@@ -357,9 +375,14 @@ try
         elseif($taggedResourceGroupNames -contains $resource.ResourceGroupName)
         {
             # resource belongs to a tagged resource group. Use the group tag
-            $parentGroup = $taggedResourceGroups | Where-Object ResourceGroupName -eq $resource.ResourceGroupName
+            $parentGroup = $resourceGroups | Where-Object ResourceGroupName -eq $resource.ResourceGroupName
             $schedule = ($parentGroup.Tags | Where-Object Name -eq $autoShutdownTagName)['Value']
             Write-Output "[$($resource.Name)]: Found parent resource group schedule tag with value: $schedule"
+        }
+        elseif($DefaultScheduleIfNotPresent)
+        {
+          $schedule = $DefaultScheduleIfNotPresent
+          Write-Output "[$($resource.Name)]: Using default schedule: $schedule"
         }
         else
         {
@@ -383,7 +406,7 @@ try
 		    $matchedSchedule = $null
         foreach($entry in $timeRangeList)
 		    {
-		        if((CheckScheduleEntry -TimeRange $entry) -eq $true)
+		        if((Test-ScheduleEntry -TimeRange $entry) -eq $true)
 		        {
 		            $scheduleMatched = $true
                 $matchedSchedule = $entry
@@ -391,7 +414,7 @@ try
 		        }
 		    }
         Add-Member -InputObject $resource -Name ScheduleMatched -MemberType NoteProperty -TypeName Boolean -Value $scheduleMatched
-
+        Add-Member -InputObject $resource -Name MatchedSchedule -MemberType NoteProperty -TypeName Boolean -Value $matchedSchedule
     }
     
     foreach($resource in $resourceList | Group-Object ScheduleMatched) {
@@ -407,26 +430,22 @@ try
       foreach($resource in $sortedResourceList)
       {		
             # Enforce desired state for group resources based on result. 
-		    if($_.ScheduleMatched)
+		    if($resource.ScheduleMatched)
 		    {
           # Schedule is matched. Shut down the resource if it is running. 
-		      Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: Current time [$currentTime] falls within the scheduled shutdown range [$matchedSchedule]"
-          Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
+		      Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: Current time [$currentTime] falls within the scheduled shutdown range [$($resource.MatchedSchedule)]"
+		      Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
 
 		    }
 		    else
 		    {
           # Schedule not matched. Start resource if stopped.
 		      Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: Current time falls outside of all scheduled shutdown ranges."
-          Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
+		      Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
 		    }	    
-		    AssertResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
+		    Assert-ResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
       }
     }
-
-
-
-
 
     Write-Output 'Finished processing resource schedules'
 }
