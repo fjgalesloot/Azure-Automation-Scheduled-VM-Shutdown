@@ -1,24 +1,25 @@
 ﻿<#
     .SYNOPSIS
-        This Azure Automation runbook automates the scheduled shutdown and startup of virtual machines in an Azure subscription. 
+        This Azure Automation runbook automates the scheduled shutdown and startup of resources in an Azure subscription. 
 
     .DESCRIPTION
-        The runbook implements a solution for scheduled power management of Azure virtual machines in combination with tags
-        on virtual machines or resource groups which define a shutdown schedule. Each time it runs, the runbook looks for all
-        virtual machines or resource groups with a tag named "AutoShutdownSchedule" having a value defining the schedule, 
-        e.g. "10PM -> 6AM". It then checks the current time against each schedule entry, ensuring that VMs with tags or in tagged groups 
-        are shut down or started to conform to the defined schedule.
+        The runbook implements a solution for scheduled power management of Azure resources in combination with tags
+        on resources or resource groups which define a shutdown schedule. Each time it runs, the runbook looks for all
+        supported resources or resource groups with a tag named "AutoShutdownSchedule" having a value defining the schedule, 
+        e.g. "10PM -> 6AM". It then checks the current time against each schedule entry, ensuring that resourcess with tags or in tagged groups 
+        are deallocated/shut down or started to conform to the defined schedule.
 
         This is a PowerShell runbook, as opposed to a PowerShell Workflow runbook.
 
-        This runbook requires the "Azure" and "AzureRM.Resources" modules which are present by default in Azure Automation accounts.
+        This script requires the "AzureRM.Resources" modules which are present by default in Azure Automation accounts.
         For detailed documentation and instructions, see: 
         
+        CREDITS: Initial version credits goes to automys from which this script started :
         https://automys.com/library/asset/scheduled-virtual-machine-shutdown-startup-microsoft-azure
 
     .PARAMETER AzureCredentialName
         The name of the PowerShell credential asset in the Automation account that contains username and password
-        for the account used to connect to target Azure subscription. This user must be configured as co-administrator and owner
+        for the account used to connect to target Azure subscription. This user must be configured as owner
         of the subscription for best functionality. 
 
         By default, the runbook will use the credential with name "Default Automation Credential"
@@ -34,6 +35,19 @@
         If $true, the runbook will not perform any power actions and will only simulate evaluating the tagged schedules. Use this
         to test your runbook to see what it will do when run normally (Simulate = $false).
 
+    .PARAMETER DefaultScheduleIfNotPresent
+        If provided, will set the default schedule to apply on all resources that don't have any scheduled tag value defined or inherited.
+
+        Description | Tag value
+        Shut down from 10PM to 6 AM UTC every day | 10pm -> 6am
+        Shut down from 10PM to 6 AM UTC every day (different format, same result as above) | 22:00 -> 06:00
+        Shut down from 8PM to 12AM and from 2AM to 7AM UTC every day (bringing online from 12-2AM for maintenance in between) | 8PM -> 12AM, 2AM -> 7AM
+        Shut down all day Saturday and Sunday (midnight to midnight) | Saturday, Sunday
+        Shut down from 2AM to 7AM UTC every day and all day on weekends | 2:00 -> 7:00, Saturday, Sunday
+        Shut down on Christmas Day and New Year’s Day | December 25, January 1
+        Shut down from 2AM to 7AM UTC every day, and all day on weekends, and on Christmas Day | 2:00 -> 7:00, Saturday, Sunday, December 25
+        Shut down always – I don’t want this VM online, ever | 0:00 -> 23:59:59
+
     .EXAMPLE
         For testing examples, see the documentation at:
 
@@ -45,21 +59,53 @@
     .OUTPUTS
         Human-readable informational and error messages produced during the job. Not intended to be consumed by another runbook.
 #>
-
+[CmdletBinding()]
 param(
     [parameter(Mandatory=$false)]
-	[String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
+    [String] $AzureCredentialName = "Use *Default Automation Credential* Asset",
     [parameter(Mandatory=$false)]
-	[String] $AzureSubscriptionName = "Use *Default Azure Subscription* Variable Value",
+    [String] $AzureSubscriptionName = "Use *Default Azure Subscription* Variable Value",
     [parameter(Mandatory=$false)]
-    [bool]$Simulate = $false
+    [bool]$Simulate = $false,
+    [parameter(Mandatory=$false)]
+    [string]$DefaultScheduleIfNotPresent
 )
 
-$VERSION = '3.0.0'
+$VERSION = '3.3.0'
 $autoShutdownTagName = 'AutoShutdownSchedule'
+$autoShutdownOrderTagName = 'ProcessingOrder'
+$defaultOrder = 1000
+
+$ResourceProcessors = @(
+  @{
+    ResourceType = 'Microsoft.ClassicCompute/virtualMachines'
+    PowerStateAction = { param([object]$Resource, [string]$DesiredState) (Get-AzureRmResource -ResourceId $Resource.ResourceId).Properties.InstanceView.PowerState }
+    StartAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'start' -Force } 
+    DeallocateAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'shutdown' -Force } 
+  },
+  @{
+    ResourceType = 'Microsoft.Compute/virtualMachines'
+    PowerStateAction = { 
+      param([object]$Resource, [string]$DesiredState)
+      
+      $vm = Get-AzureRmVM -ResourceGroupName $Resource.ResourceGroupName -Name $Resource.Name -Status
+      $currentStatus = $vm.Statuses | Where-Object Code -like 'PowerState*' 
+      $currentStatus.Code -replace 'PowerState/',''
+    }
+    StartAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'start' -Force } 
+    DeallocateAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'deallocate' -Force } 
+  },
+  @{
+    ResourceType = 'Microsoft.Compute/virtualMachineScaleSets'
+    #since there is no way to get the status of a VMSS, we assume it is in the inverse state to force the action on the whole VMSS
+    PowerStateAction = { param([object]$Resource, [string]$DesiredState) if($DesiredState -eq 'StoppedDeallocated') { 'Started' } else { 'StoppedDeallocated' } }
+    StartAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'start' -Parameters @{ instanceIds = @('*') } -Force } 
+    DeallocateAction = { param([string]$ResourceId) Invoke-AzureRmResourceAction -ResourceId $ResourceId -Action 'deallocate' -Parameters @{ instanceIds = @('*') } -Force } 
+  }
+)
 
 # Define function to check current time against specified range
-function CheckScheduleEntry ([string]$TimeRange)
+function Test-ScheduleEntry ([string]$TimeRange)
 {	
 	# Initialize variables
 	$rangeStart, $rangeEnd, $parsedDay = $null
@@ -69,9 +115,9 @@ function CheckScheduleEntry ([string]$TimeRange)
 	try
 	{
 	    # Parse as range if contains '->'
-	    if($TimeRange -like "*->*")
+	    if($TimeRange -like '*->*')
 	    {
-	        $timeRangeComponents = $TimeRange -split "->" | foreach {$_.Trim()}
+	        $timeRangeComponents = $TimeRange -split '->' | foreach {$_.Trim()}
 	        if($timeRangeComponents.Count -eq 2)
 	        {
 	            $rangeStart = Get-Date $timeRangeComponents[0]
@@ -105,7 +151,7 @@ function CheckScheduleEntry ([string]$TimeRange)
 	        {
 	            if($TimeRange -eq (Get-Date).DayOfWeek)
 	            {
-	                $parsedDay = Get-Date "00:00"
+	                $parsedDay = Get-Date '00:00'
 	            }
 	            else
 	            {
@@ -128,7 +174,7 @@ function CheckScheduleEntry ([string]$TimeRange)
 	catch
 	{
 	    # Record any errors and return false by default
-	    Write-Output "`tWARNING: Exception encountered while parsing time range. Details: $($_.Exception.Message). Check the syntax of entry, e.g. '<StartTime> -> <EndTime>', or days/dates like 'Sunday' and 'December 25'"   
+	    Write-Output "`tWARNING: Exception encountered while parsing time range. Details: $($_.Exception.Message). Check the syntax of entry, e.g. '<StartTime> -> <EndTime>', or days/dates like 'Sunday' and 'December 25'"
 	    return $false
 	}
 	
@@ -142,125 +188,57 @@ function CheckScheduleEntry ([string]$TimeRange)
 	    return $false
 	}
 	
-} # End function CheckScheduleEntry
+} # End function Test-ScheduleEntry
 
-# Function to handle power state assertion for both classic and resource manager VMs
-function AssertVirtualMachinePowerState
+
+# Function to handle power state assertion for resources
+function Assert-ResourcePowerState
 {
     param(
-        [Object]$VirtualMachine,
-        [string]$DesiredState,
-        [Object[]]$VirtualMachineList,
-        [bool]$Simulate
-    )
-
-    # Get VM depending on type
-    if($VirtualMachine.ResourceType -eq "Microsoft.ClassicCompute/virtualMachines")
-    {
-        $classicVM = Get-AzureRmResource -ResourceId $VirtualMachine.ResourceId
-        AssertClassicVirtualMachinePowerState -VirtualMachine $classicVM -DesiredState $DesiredState -Simulate $Simulate
-    }
-    elseif($VirtualMachine.ResourceType -eq "Microsoft.Compute/virtualMachines")
-    {
-        $resourceManagerVM = $VirtualMachineList | where Name -eq $VirtualMachine.Name
-        AssertResourceManagerVirtualMachinePowerState -VirtualMachine $resourceManagerVM -DesiredState $DesiredState -Simulate $Simulate
-    }
-    else
-    {
-        Write-Output "VM type not recognized: [$($VirtualMachine.ResourceType)]. Skipping."
-    }
-}
-
-# Function to handle power state assertion for classic VM
-function AssertClassicVirtualMachinePowerState
-{
-    param(
-        [Object]$VirtualMachine,
+        [Parameter(Mandatory=$true)]
+        [object]$Resource,
+        [Parameter(Mandatory=$true)]
         [string]$DesiredState,
         [bool]$Simulate
     )
 
-    # If should be started and isn't, start VM
-	if($DesiredState -eq "Started" -and $VirtualMachine.PowerState -notmatch "Started|Starting")
+  $processor = $ResourceProcessors | Where-Object ResourceType -eq $Resource.ResourceType
+  if(-not $processor) {
+    throw ('Unable to find a resource processor for type ''{0}''. Resource: {1}' -f $Resource.ResourceType, ($Resource | ConvertTo-Json -Depth 5000))
+  }
+  # If should be started and isn't, start resource
+  $currentPowerState = & $processor.PowerStateAction -Resource $Resource -DesiredState $DesiredState
+	if($DesiredState -eq 'Started' -and $currentPowerState -notmatch 'Started|Starting|running')
 	{
 		if($Simulate)
         {
-            Write-Output "[$($VirtualMachine.Name)]: SIMULATION -- Would have started VM. (No action taken)"
+            Write-Output "[$($Resource.Name) `- P$($Resource.ProcessingOrder)]: SIMULATION -- Would have started resource. (No action taken)"
         }
         else
         {
-            Write-Output "[$($VirtualMachine.Name)]: Starting VM"
-            Invoke-AzureRmResourceAction -ResourceId $VirtualMachine.ResourceId -Action 'start' -Force
+            Write-Output "[$($Resource.Name) `- P$($Resource.ProcessingOrder)]: Starting resource"
+            & $processor.StartAction -ResourceId $Resource.ResourceId
         }
 	}
 		
-	# If should be stopped and isn't, stop VM
-	elseif($DesiredState -eq "StoppedDeallocated" -and $VirtualMachine.PowerState -ne "Stopped")
+	# If should be stopped and isn't, stop resource
+	elseif($DesiredState -eq 'StoppedDeallocated' -and $currentPowerState -notmatch 'Stopped|deallocated')
 	{
         if($Simulate)
         {
-            Write-Output "[$($VirtualMachine.Name)]: SIMULATION -- Would have stopped VM. (No action taken)"
+            Write-Output "[$($Resource.Name) `- P$($Resource.ProcessingOrder)]: SIMULATION -- Would have stopped resource. (No action taken)"
         }
         else
         {
-            Write-Output "[$($VirtualMachine.Name)]: Stopping VM"
-            Invoke-AzureRmResourceAction -ResourceId $VirtualMachine.ResourceId -Action 'shutdown' -Force
+            Write-Output "[$($Resource.Name) `- P$($Resource.ProcessingOrder)]: Stopping resource"
+            & $processor.DeallocateAction -ResourceId $Resource.ResourceId
         }
 	}
 
     # Otherwise, current power state is correct
     else
     {
-        Write-Output "[$($VirtualMachine.Name)]: Current power state [$($VirtualMachine.PowerState)] is correct."
-    }
-}
-
-# Function to handle power state assertion for resource manager VM
-function AssertResourceManagerVirtualMachinePowerState
-{
-    param(
-        [Object]$VirtualMachine,
-        [string]$DesiredState,
-        [bool]$Simulate
-    )
-
-    # Get VM with current status
-    $resourceManagerVM = Get-AzureRmVM -ResourceGroupName $VirtualMachine.ResourceGroupName -Name $VirtualMachine.Name -Status
-    $currentStatus = $resourceManagerVM.Statuses | where Code -like "PowerState*" 
-    $currentStatus = $currentStatus.Code -replace "PowerState/",""
-
-    # If should be started and isn't, start VM
-	if($DesiredState -eq "Started" -and $currentStatus -notmatch "running")
-	{
-        if($Simulate)
-        {
-            Write-Output "[$($VirtualMachine.Name)]: SIMULATION -- Would have started VM. (No action taken)"
-        }
-        else
-        {
-            Write-Output "[$($VirtualMachine.Name)]: Starting VM"
-            $resourceManagerVM | Start-AzureRmVM
-        }
-	}
-		
-	# If should be stopped and isn't, stop VM
-	elseif($DesiredState -eq "StoppedDeallocated" -and $currentStatus -ne "deallocated")
-	{
-        if($Simulate)
-        {
-            Write-Output "[$($VirtualMachine.Name)]: SIMULATION -- Would have stopped VM. (No action taken)"
-        }
-        else
-        {
-            Write-Output "[$($VirtualMachine.Name)]: Stopping VM"
-            $resourceManagerVM | Stop-AzureRmVM -Force
-        }
-	}
-
-    # Otherwise, current power state is correct
-    else
-    {
-        Write-Output "[$($VirtualMachine.Name)]: Current power state [$currentStatus] is correct."
+        Write-Output "[$($Resource.Name) `- P$($Resource.ProcessingOrder)]: Current power state [$($currentPowerState)] is correct."
     }
 }
 
@@ -271,18 +249,18 @@ try
     Write-Output "Runbook started. Version: $VERSION"
     if($Simulate)
     {
-        Write-Output "*** Running in SIMULATE mode. No power actions will be taken. ***"
+        Write-Output '*** Running in SIMULATE mode. No power actions will be taken. ***'
     }
     else
     {
-        Write-Output "*** Running in LIVE mode. Schedules will be enforced. ***"
+        Write-Output '*** Running in LIVE mode. Schedules will be enforced. ***'
     }
-    Write-Output "Current UTC/GMT time [$($currentTime.ToString("dddd, yyyy MMM dd HH:mm:ss"))] will be checked against schedules"
+    Write-Output "Current UTC/GMT time [$($currentTime.ToString('dddd, yyyy MMM dd HH:mm:ss'))] will be checked against schedules"
 	
     # Retrieve subscription name from variable asset if not specified
-    if($AzureSubscriptionName -eq "Use *Default Azure Subscription* Variable Value")
+    if($AzureSubscriptionName -eq 'Use *Default Azure Subscription* Variable Value')
     {
-        $AzureSubscriptionName = Get-AutomationVariable -Name "Default Azure Subscription"
+        $AzureSubscriptionName = Get-AutomationVariable -Name 'Default Azure Subscription'
         if($AzureSubscriptionName.length -gt 0)
         {
             Write-Output "Specified subscription name/ID: [$AzureSubscriptionName]"
@@ -295,10 +273,10 @@ try
 
     # Retrieve credential
     write-output "Specified credential asset name: [$AzureCredentialName]"
-    if($AzureCredentialName -eq "Use *Default Automation Credential* asset")
+    if($AzureCredentialName -eq 'Use *Default Automation Credential* asset')
     {
         # By default, look for "Default Automation Credential" asset
-        $azureCredential = Get-AutomationPSCredential -Name "Default Automation Credential"
+        $azureCredential = Get-AutomationPSCredential -Name 'Default Automation Credential'
         if($azureCredential -ne $null)
         {
 		    Write-Output "Attempting to authenticate as: [$($azureCredential.UserName)]"
@@ -331,11 +309,11 @@ try
 
 
     # Validate subscription
-    $subscriptions = @(Get-AzureRmSubscription | where {$_.SubscriptionName -eq $AzureSubscriptionName -or $_.SubscriptionId -eq $AzureSubscriptionName})
+    $subscriptions = @(Get-AzureRmSubscription | Where-Object {$_.SubscriptionName -eq $AzureSubscriptionName -or $_.SubscriptionId -eq $AzureSubscriptionName})
     if($subscriptions.Count -eq 1)
     {
         # Set working subscription
-        $targetSubscription = $subscriptions | select -First 1
+        $targetSubscription = $subscriptions | Select-Object -First 1
         Set-AzureRmContext -SubscriptionId $targetSubscription.SubscriptionId
 
         $currentSubscription = (Get-AzureRmContext).Subscription
@@ -345,92 +323,131 @@ try
     {
         if($subscription.Count -eq 0)
         {
-            throw "No accessible subscription found with name or ID [$AzureSubscriptionName]. Check the runbook parameters and ensure user is a co-administrator on the target subscription."
+            throw "No accessible subscription found with name or ID [$AzureSubscriptionName]. Check the runbook parameters and ensure user has proper rights on the target subscription."
         }
         elseif($subscriptions.Count -gt 1)
         {
             throw "More than one accessible subscription found with name or ID [$AzureSubscriptionName]. Please ensure your subscription names are unique, or specify the ID instead"
         }
     }
-    $vmList = @()
-    # Get a list of all virtual machines in subscription
-    $vmList += @(Find-AzureRmResource -ResourceType 'Microsoft.Compute/virtualMachines' | sort Name)
-    $vmList += @(Find-AzureRmResource -ResourceType 'Microsoft.ClassicCompute/virtualMachines' | sort Name)
+
+    $resourceList = @()
+    # Get a list of all supported resources in subscription
+    $ResourceProcessors | % {
+      Write-Output ('Looking for resources of type {0}' -f $_.ResourceType)
+      $resourceList += @(Find-AzureRmResource -ResourceType $_.ResourceType)
+    }
+
+    $ResourceList | % {     
+      if($_.Tags -and $_.Tags.Name -contains $autoShutdownOrderTagName ) {
+        $order = $_.Tags | % { if($_.Name -eq $autoShutdownOrderTagName) { $_.Value } }
+      } else {
+        $order = $defaultOrder
+      }
+      Add-Member -InputObject $_ -Name ProcessingOrder -MemberType NoteProperty -TypeName Integer -Value $order
+    }
+
 
     # Get resource groups that are tagged for automatic shutdown of resources
-	$taggedResourceGroups = @(Get-AzureRmResourceGroup | where {$_.Tags.Count -gt 0 -and $_.Tags.Name -contains $autoShutdownTagName})
-    $taggedResourceGroupNames = @($taggedResourceGroups | select -ExpandProperty ResourceGroupName)
-    Write-Output "Found [$($taggedResourceGroups.Count)] schedule-tagged resource groups in subscription"	
+    $resourceGroups = @(Get-AzureRmResourceGroup)
+    $taggedResourceGroupNames = @($resourceGroups | Where-Object {$_.Tags.Count -gt 0 -and $_.Tags.Name -contains $autoShutdownTagName} | Select-Object -ExpandProperty ResourceGroupName)
+    Write-Output "Found [$($taggedResourceGroupNames.Count)] schedule-tagged resource groups in subscription"	
+    if($DefaultScheduleIfNotPresent) {
+      Write-Output "Default schedule was specified, all non tagged resources will inherit this schedule: $DefaultScheduleIfNotPresent"
+    }
 
-    # For each VM, determine
+    # For each resource, determine
     #  - Is it directly tagged for shutdown or member of a tagged resource group
     #  - Is the current time within the tagged schedule 
     # Then assert its correct power state based on the assigned schedule (if present)
-    Write-Output "Processing [$($vmList.Count)] virtual machines found in subscription"
-    foreach($vm in $vmList)
+    Write-Output "Processing [$($resourceList.Count)] resources found in subscription"
+    foreach($resource in $resourceList)
     {
         $schedule = $null
 
         # Check for direct tag or group-inherited tag
-        if($vm.ResourceType -eq "Microsoft.Compute/virtualMachines" -and $vm.Tags -and $vm.Tags.Name -contains $autoShutdownTagName)
+        if($resource.Tags -and $resource.Tags.Name -contains $autoShutdownTagName)
         {
-            # VM has direct tag (possible for resource manager deployment model VMs). Prefer this tag schedule.
-            $schedule = ($vm.Tags | where Name -eq $autoShutdownTagName)["Value"]
-            Write-Output "[$($vm.Name)]: Found direct VM schedule tag with value: $schedule"
+            # Resource has direct tag (possible for resource manager deployment model resources). Prefer this tag schedule.
+            $schedule = ($resource.Tags | Where-Object Name -eq $autoShutdownTagName)['Value']
+            Write-Output "[$($resource.Name)]: Found direct resource schedule tag with value: $schedule"
         }
-        elseif($taggedResourceGroupNames -contains $vm.ResourceGroupName)
+        elseif($taggedResourceGroupNames -contains $resource.ResourceGroupName)
         {
-            # VM belongs to a tagged resource group. Use the group tag
-            $parentGroup = $taggedResourceGroups | where ResourceGroupName -eq $vm.ResourceGroupName
-            $schedule = ($parentGroup.Tags | where Name -eq $autoShutdownTagName)["Value"]
-            Write-Output "[$($vm.Name)]: Found parent resource group schedule tag with value: $schedule"
+            # resource belongs to a tagged resource group. Use the group tag
+            $parentGroup = $resourceGroups | Where-Object ResourceGroupName -eq $resource.ResourceGroupName
+            $schedule = ($parentGroup.Tags | Where-Object Name -eq $autoShutdownTagName)['Value']
+            Write-Output "[$($resource.Name)]: Found parent resource group schedule tag with value: $schedule"
+        }
+        elseif($DefaultScheduleIfNotPresent)
+        {
+          $schedule = $DefaultScheduleIfNotPresent
+          Write-Output "[$($resource.Name)]: Using default schedule: $schedule"
         }
         else
         {
-            # No direct or inherited tag. Skip this VM.
-            Write-Output "[$($vm.Name)]: Not tagged for shutdown directly or via membership in a tagged resource group. Skipping this VM."
+            # No direct or inherited tag. Skip this resource.
+            Write-Output "[$($resource.Name)]: Not tagged for shutdown directly or via membership in a tagged resource group. Skipping this resource."
             continue
         }
 
         # Check that tag value was succesfully obtained
         if($schedule -eq $null)
         {
-            Write-Output "[$($vm.Name)]: Failed to get tagged schedule for virtual machine. Skipping this VM."
+            Write-Output "[$($resource.Name) `- $($resource.ProcessingOrder)]: Failed to get tagged schedule for resource. Skipping this resource."
             continue
         }
 
-        # Parse the ranges in the Tag value. Expects a string of comma-separated time ranges, or a single time range
-		$timeRangeList = @($schedule -split "," | foreach {$_.Trim()})
+		    # Parse the ranges in the Tag value. Expects a string of comma-separated time ranges, or a single time range
+		    $timeRangeList = @($schedule -split ',' | foreach {$_.Trim()})
 	    
-        # Check each range against the current time to see if any schedule is matched
-		$scheduleMatched = $false
-        $matchedSchedule = $null
-		foreach($entry in $timeRangeList)
-		{
-		    if((CheckScheduleEntry -TimeRange $entry) -eq $true)
+		    # Check each range against the current time to see if any schedule is matched
+		    $scheduleMatched = $false
+		    $matchedSchedule = $null
+        foreach($entry in $timeRangeList)
 		    {
-		        $scheduleMatched = $true
+		        if((Test-ScheduleEntry -TimeRange $entry) -eq $true)
+		        {
+		            $scheduleMatched = $true
                 $matchedSchedule = $entry
-		        break
+		            break
+		        }
 		    }
-		}
+        Add-Member -InputObject $resource -Name ScheduleMatched -MemberType NoteProperty -TypeName Boolean -Value $scheduleMatched
+        Add-Member -InputObject $resource -Name MatchedSchedule -MemberType NoteProperty -TypeName Boolean -Value $matchedSchedule
+    }
+    
+    foreach($resource in $resourceList | Group-Object ScheduleMatched) {
+      if($resource.Name -eq '') {continue}
+      $sortedResourceList = @()
+      if($resource.Name -eq $false) {
+        # meaning we start resources, lower to higher
+        $sortedResourceList += @($resource.Group | Sort ProcessingOrder)
+      } else { 
+        $sortedResourceList += @($resource.Group | Sort ProcessingOrder -Descending)
+      }
 
-        # Enforce desired state for group resources based on result. 
-		if($scheduleMatched)
-		{
-            # Schedule is matched. Shut down the VM if it is running. 
-		    Write-Output "[$($vm.Name)]: Current time [$currentTime] falls within the scheduled shutdown range [$matchedSchedule]"
-		    AssertVirtualMachinePowerState -VirtualMachine $vm -DesiredState "StoppedDeallocated" -VirtualMachineList $vmList -Simulate $Simulate
-		}
-		else
-		{
-            # Schedule not matched. Start VM if stopped.
-		    Write-Output "[$($vm.Name)]: Current time falls outside of all scheduled shutdown ranges."
-		    AssertVirtualMachinePowerState -VirtualMachine $vm -DesiredState "Started" -VirtualMachineList $vmList -Simulate $Simulate
-		}	    
+      foreach($resource in $sortedResourceList)
+      {		
+            # Enforce desired state for group resources based on result. 
+		    if($resource.ScheduleMatched)
+		    {
+          # Schedule is matched. Shut down the resource if it is running. 
+		      Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: Current time [$currentTime] falls within the scheduled shutdown range [$($resource.MatchedSchedule)]"
+		      Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
+
+		    }
+		    else
+		    {
+          # Schedule not matched. Start resource if stopped.
+		      Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: Current time falls outside of all scheduled shutdown ranges."
+		      Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
+		    }	    
+		    Assert-ResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
+      }
     }
 
-    Write-Output "Finished processing virtual machine schedules"
+    Write-Output 'Finished processing resource schedules'
 }
 catch
 {
@@ -439,5 +456,5 @@ catch
 }
 finally
 {
-    Write-Output "Runbook finished (Duration: $(("{0:hh\:mm\:ss}" -f ((Get-Date).ToUniversalTime() - $currentTime))))"
+    Write-Output "Runbook finished (Duration: $(('{0:hh\:mm\:ss}' -f ((Get-Date).ToUniversalTime() - $currentTime))))"
 }
