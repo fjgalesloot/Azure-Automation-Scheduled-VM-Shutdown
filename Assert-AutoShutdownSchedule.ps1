@@ -47,6 +47,12 @@
         Shut down on Christmas Day and New Year’s Day | December 25, January 1
         Shut down from 2AM to 7AM UTC every day, and all day on weekends, and on Christmas Day | 2:00 -> 7:00, Saturday, Sunday, December 25
         Shut down always – I don’t want this VM online, ever | 0:00 -> 23:59:59
+        
+    
+    .PARAMETER TimeZone
+        Defines the Timezone used when running the runbook. "GMT Standard Time" by default.
+        Microsoft Time Zone Index Values:
+        https://msdn.microsoft.com/en-us/library/ms912391(v=winembedded.11).aspx
 
     .EXAMPLE
         For testing examples, see the documentation at:
@@ -68,7 +74,9 @@ param(
     [parameter(Mandatory=$false)]
     [bool]$Simulate = $false,
     [parameter(Mandatory=$false)]
-    [string]$DefaultScheduleIfNotPresent
+    [string]$DefaultScheduleIfNotPresent,
+    [parameter(Mandatory=$false)]
+    [String] $Timezone = "W. Europe Standard Time"
 )
 
 $VERSION = '3.3.0'
@@ -104,12 +112,18 @@ $ResourceProcessors = @(
   }
 )
 
+# Define function to get current date using the TimeZone Paremeter
+function GetCurrentDate
+{
+    return [system.timezoneinfo]::ConvertTime($(Get-Date),$([system.timezoneinfo]::GetSystemTimeZones() | ? id -eq $Timezone))
+}
+
 # Define function to check current time against specified range
 function Test-ScheduleEntry ([string]$TimeRange)
 {	
 	# Initialize variables
 	$rangeStart, $rangeEnd, $parsedDay = $null
-	$currentTime = (Get-Date).ToUniversalTime()
+	$currentTime = GetCurrentDate
     $midnight = $currentTime.AddDays(1).Date	        
 
 	try
@@ -245,7 +259,7 @@ function Assert-ResourcePowerState
 # Main runbook content
 try
 {
-    $currentTime = (Get-Date).ToUniversalTime()
+    $currentTime = GetCurrentDate
     Write-Output "Runbook started. Version: $VERSION"
     if($Simulate)
     {
@@ -456,5 +470,5 @@ catch
 }
 finally
 {
-    Write-Output "Runbook finished (Duration: $(('{0:hh\:mm\:ss}' -f ((Get-Date).ToUniversalTime() - $currentTime))))"
+    Write-Output "Runbook finished (Duration: $(('{0:hh\:mm\:ss}' -f ((GetCurrentDate) - $currentTime))))"
 }
