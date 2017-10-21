@@ -351,6 +351,7 @@ try
         # Check each range against the current time to see if any schedule is matched
         $scheduleMatched = $false
         $matchedSchedule = $null
+        $neverStart = $false #if NeverStart is specified in range, do not wake-up machine
         foreach($entry in $timeRangeList)
         {
             if((Test-ScheduleEntry -TimeRange $entry) -eq $true)
@@ -359,9 +360,15 @@ try
                 $matchedSchedule = $entry
                 break
             }
+            
+            if ($entry -eq "NeverStart")
+            {
+                $neverStart = $true
+            }
         }
         Add-Member -InputObject $resource -Name ScheduleMatched -MemberType NoteProperty -TypeName Boolean -Value $scheduleMatched
         Add-Member -InputObject $resource -Name MatchedSchedule -MemberType NoteProperty -TypeName Boolean -Value $matchedSchedule
+        Add-Member -InputObject $resource -Name NeverStart -MemberType NoteProperty -TypeName Boolean -Value $neverStart
     }
     
     foreach($resource in $resourceList | Group-Object ScheduleMatched) {
@@ -386,9 +393,16 @@ try
             }
             else
             {
-                # Schedule not matched. Start resource if stopped.
-                Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tSKIPPING -- Current time falls outside of all scheduled shutdown ranges."
-                Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
+                if ($resource.NeverStart)
+                {
+                    Write-Output "[$($vm.Name)]: `tIGNORED -- Resource marked with NeverStart. Not starting the resource."
+                }
+                else
+                {
+                    # Schedule not matched. Start resource if stopped.
+                    Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tCHANGING -- Current time falls outside of all scheduled shutdown ranges. Start resource."
+                    Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
+                }                
             }	    
             Assert-ResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
         }
