@@ -30,9 +30,9 @@
         Shut down from 8PM to 12AM and from 2AM to 7AM UTC every day (bringing online from 12-2AM for maintenance in between) | 8PM -> 12AM, 2AM -> 7AM
         Shut down all day Saturday and Sunday (midnight to midnight) | Saturday, Sunday
         Shut down from 2AM to 7AM UTC every day and all day on weekends | 2:00 -> 7:00, Saturday, Sunday
-        Shut down on Christmas Day and New Year’s Day | December 25, January 1
+        Shut down on Christmas Day and New Year?s Day | December 25, January 1
         Shut down from 2AM to 7AM UTC every day, and all day on weekends, and on Christmas Day | 2:00 -> 7:00, Saturday, Sunday, December 25
-        Shut down always – I don’t want this VM online, ever | 0:00 -> 23:59:59
+        Shut down always ? I don?t want this VM online, ever | 0:00 -> 23:59:59
         
     
         .PARAMETER TimeZone
@@ -387,7 +387,7 @@ try
             if($resource.ScheduleMatched)
             {
                 # Schedule is matched. Shut down the resource if it is running. 
-                Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tCHANGING -- Current time [$currentTime] falls within the scheduled shutdown range [$($resource.MatchedSchedule)]"
+                Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tASSERT -- Current time [$currentTime] falls within the scheduled shutdown range [$($resource.MatchedSchedule)]"
                 Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
 
             }
@@ -395,12 +395,13 @@ try
             {
                 if ($resource.NeverStart)
                 {
-                    Write-Output "[$($vm.Name)]: `tIGNORED -- Resource marked with NeverStart. Not starting the resource."
+                    Write-Output "[$($resource.Name)]: `tIGNORED -- Resource marked with NeverStart. Keeping the resources stopped."
+                    Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
                 }
                 else
                 {
                     # Schedule not matched. Start resource if stopped.
-                    Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tCHANGING -- Current time falls outside of all scheduled shutdown ranges. Start resource."
+                    Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tASSERT -- Current time falls outside of all scheduled shutdown ranges. Start resource."
                     Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
                 }                
             }	    
