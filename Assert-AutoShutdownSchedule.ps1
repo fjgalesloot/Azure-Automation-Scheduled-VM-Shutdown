@@ -262,7 +262,7 @@ try
     # Get a list of all supported resources in subscription
     $ResourceProcessors | % {
         Write-Output ('Looking for resources of type {0}' -f $_.ResourceType)
-        $resourceList += @(Find-AzureRmResource -ResourceType $_.ResourceType)
+        $resourceList += @(Get-AzureRmResource -ResourceType $_.ResourceType)
     }
 
     $ResourceList | % {     
@@ -284,7 +284,7 @@ try
     }
 
     # Get resource groups that are tagged for automatic shutdown of resources
-    $taggedResourceGroups = Find-AzureRmResourceGroup -Tag @{ "AutoShutdownSchedule" = $null }
+    $taggedResourceGroups = Get-AzureRmResourceGroup -Tag @{ "AutoShutdownSchedule" = $null }
     $taggedResourceGroupNames = @($taggedResourceGroups | select Name)
     
     Write-Output "Found [$($taggedResourceGroupNames.Count)] schedule-tagged resource groups in subscription"	
