@@ -262,7 +262,7 @@ try
     # Get a list of all supported resources in subscription
     $ResourceProcessors | % {
         Write-Output ('Looking for resources of type {0}' -f $_.ResourceType)
-        $resourceList += @(Get-AzureRmResource -ResourceType $_.ResourceType)
+        $resourceList += @(Get-AzureRmResource -ODataQuery ("`$filter=resourcetype eq '{0}'" -f $_.ResourceType))
     }
 
     $ResourceList | % {     
