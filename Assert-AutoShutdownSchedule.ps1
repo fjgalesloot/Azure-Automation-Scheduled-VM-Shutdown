@@ -395,8 +395,7 @@ try
             {
                 if ($resource.NeverStart)
                 {
-                    Write-Output "[$($resource.Name)]: `tIGNORED -- Resource marked with NeverStart. Should have been started, but not doing anything."
-                    
+                    Write-Output "[$($resource.Name)]: `tIGNORED -- Resource marked with NeverStart. Should have been started, but not doing anything."                    
                 }
                 else
                 {
