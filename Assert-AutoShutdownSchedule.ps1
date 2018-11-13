@@ -262,7 +262,7 @@ try
     # Get a list of all supported resources in subscription
     $ResourceProcessors | % {
         Write-Output ('Looking for resources of type {0}' -f $_.ResourceType)
-        $resourceList += @(Get-AzureRmResource -ResourceType $_.ResourceType)
+        $resourceList += @(Get-AzureRmResource -ODataQuery ("`$filter=resourcetype eq '{0}'" -f $_.ResourceType))
     }
 
     $ResourceList | % {     
@@ -389,23 +389,22 @@ try
                 # Schedule is matched. Shut down the resource if it is running. 
                 Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tASSERT -- Current time [$currentTime] falls within the scheduled shutdown range [$($resource.MatchedSchedule)]"
                 Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
-
+                Assert-ResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
             }
             else
             {
                 if ($resource.NeverStart)
                 {
-                    Write-Output "[$($resource.Name)]: `tIGNORED -- Resource marked with NeverStart. Keeping the resources stopped."
-                    Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName String -Value 'StoppedDeallocated'
+                    Write-Output "[$($resource.Name)]: `tIGNORED -- Resource marked with NeverStart. Should have been started, but not doing anything."                    
                 }
                 else
                 {
                     # Schedule not matched. Start resource if stopped.
                     Write-Output "[$($resource.Name) `- P$($resource.ProcessingOrder)]: `r`n`tASSERT -- Current time falls outside of all scheduled shutdown ranges. Start resource."
                     Add-Member -InputObject $resource -Name DesiredState -MemberType NoteProperty -TypeName Boolean -Value 'Started'
+                    Assert-ResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
                 }                
             }	    
-            Assert-ResourcePowerState -Resource $resource -DesiredState $resource.DesiredState -Simulate $Simulate
         }
     }
 
