@@ -219,7 +219,8 @@ function Assert-ResourcePowerState
     }
 		
     # If should be stopped and isn't, stop resource
-    elseif($DesiredState -eq 'StoppedDeallocated' -and $currentPowerState -notmatch 'Stopped|deallocated')
+    #elseif($DesiredState -eq 'StoppedDeallocated' -and $currentPowerState -notmatch 'Stopped|deallocated')
+    elseif($DesiredState -eq 'StoppedDeallocated' -and $currentPowerState -notmatch 'deallocated')
     {
         if($Simulate)
         {
