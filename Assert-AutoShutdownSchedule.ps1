@@ -285,7 +285,7 @@ try
 
     # Get resource groups that are tagged for automatic shutdown of resources
     $taggedResourceGroups = Get-AzureRmResourceGroup -Tag @{ "AutoShutdownSchedule" = $null }
-    $taggedResourceGroupNames = @($taggedResourceGroups | select Name)
+    $taggedResourceGroupNames = @($taggedResourceGroups | select ResourceGroupName)
     
     Write-Output "Found [$($taggedResourceGroupNames.Count)] schedule-tagged resource groups in subscription"	
     
@@ -319,7 +319,7 @@ try
             $schedule = $resource.Tags.Item($autoShutdownTagName)
             Write-Output "[$($resource.Name)]: `r`n`tADDING -- Found direct resource schedule tag with value: $schedule"
         }
-        elseif($taggedResourceGroupNames -contains $resource.ResourceGroupName)
+        elseif($taggedResourceGroupNames.ResourceGroupName -contains $resource.ResourceGroupName)
         {
             # resource belongs to a tagged resource group. Use the group tag
             $parentGroup = $resourceGroups | Where-Object Name -eq $resource.ResourceGroupName
