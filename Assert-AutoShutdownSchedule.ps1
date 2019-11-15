@@ -322,7 +322,7 @@ try
         elseif($taggedResourceGroupNames.ResourceGroupName -contains $resource.ResourceGroupName)
         {
             # resource belongs to a tagged resource group. Use the group tag
-            $parentGroup = $resourceGroups | Where-Object Name -eq $resource.ResourceGroupName
+            $parentGroup = $resourceGroups | Where-Object ResourceGroupName -eq $resource.ResourceGroupName
             $schedule = $parentGroup.Tags.Item($AUTOSHUTDOWNSCHEDULE_KEYWORD)
             Write-Output "[$($resource.Name)]: `r`n`tADDING -- Found parent resource group schedule tag with value: $schedule"
         }
