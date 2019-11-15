@@ -61,7 +61,7 @@ param(
     [String] $Timezone = "W. Europe Standard Time"
 )
 
-$VERSION = '3.3.0'
+$VERSION = '3.4.0'
 $autoShutdownTagName = 'AutoShutdownSchedule'
 $autoShutdownOrderTagName = 'ProcessingOrder'
 $autoShutdownDisabledTagName = 'AutoShutdownDisabled'
