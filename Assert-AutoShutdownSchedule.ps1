@@ -286,6 +286,14 @@ try
     # Get resource groups that are tagged for automatic shutdown of resources
     $taggedResourceGroups = Get-AzureRmResourceGroup -Tag @{ "AutoShutdownSchedule" = $null }
     $taggedResourceGroupNames = @($taggedResourceGroups | select ResourceGroupName)
+	$taggedResourceGroups | % {     
+        if($_.Tags -and $_.Tags.ContainsKey($autoShutdownDisabledTagName) ) {
+            $disabled = $_.Tags | % { if($_.ContainsKey($autoShutdownDisabledTagName)) { $_.Item($autoShutdownDisabledTagName) } }
+        } else {
+            $disabled = '0'
+        }
+        Add-Member -InputObject $_ -Name ScheduleDisabled -MemberType NoteProperty -TypeName String -Value $disabled
+    }
     
     Write-Output "Found [$($taggedResourceGroupNames.Count)] schedule-tagged resource groups in subscription"	
     
